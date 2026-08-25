@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://glama.ai/mcp/servers/drolosoft/immich-photo-manager"><img src="https://glama.ai/mcp/servers/drolosoft/immich-photo-manager/badges/score.svg" alt="immich-photo-manager MCP server"></a>
-  <a href="https://github.com/drolosoft/immich-photo-manager/releases/tag/v1.0.0"><img src="https://img.shields.io/github/v/release/drolosoft/immich-photo-manager" alt="GitHub Release"></a>
+  <a href="https://github.com/drolosoft/immich-photo-manager/releases/latest"><img src="https://img.shields.io/github/v/release/drolosoft/immich-photo-manager" alt="GitHub Release"></a>
   <a href="https://immich.app"><img src="https://img.shields.io/badge/Immich-ecosystem-blueviolet.svg" alt="Immich"></a>
 </p>
 
@@ -43,8 +43,9 @@ GPS coordinates, CLIP visual search, and temporal matching — combined in one r
 git clone https://github.com/drolosoft/immich-photo-manager.git
 cd immich-photo-manager
 
-claude plugin marketplace add .
+claude plugin marketplace add ./
 claude plugin install immich-photo-manager
+./scripts/setup-mcp.sh
 ```
 
 That's it. Ask Claude: **"how healthy is my photo library?"**
@@ -94,7 +95,7 @@ Model:  gemma4-26b-it (local, LM Studio)
 Query:  "Show me my Lanzarote albums"
 
 1. Getting MCP tool schemas...
-   50 MCP tools available
+   53 MCP tools available
 
 2. Asking Gemma 4...
    Gemma 4 chose: list_albums({})
@@ -144,7 +145,7 @@ RESULT: Zero cloud dependency — fully self-hosted stack.
 
 <p align="center"><img src="./assets/screenshot-03-gallery-selection.png" alt="Interactive gallery with Cowork Actions" width="700"></p>
 
-> Select photos in the gallery, click an action, and paste the command into Claude. See **[Skills Reference](doc/SKILLS.md)** for all 11 skills.
+> Select photos in the gallery, click an action, and paste the command into Claude. See **[Skills Reference](doc/SKILLS.md)** for all 12 skills.
 
 ---
 
@@ -170,8 +171,9 @@ Immich is excellent at storing and viewing your photos. But managing a large lib
 | Document | Description |
 |----------|-------------|
 | **[Getting Started](doc/GETTING-STARTED.md)** | Installation, manual MCP setup, deployment options, and troubleshooting |
+| **[Environment Setup](doc/GETTING-STARTED.md#environment-setup-detailed)** | Detailed setup: git, Python, venv, HTTP/stdio launch, Open WebUI, and common issues |
 | **[Skills Reference](doc/SKILLS.md)** | All 12 skills — workflows, triggers, parameters, output formats |
-| **[MCP Tools Reference](doc/MCP-TOOLS.md)** | All 50 MCP tools — parameters, return types, examples |
+| **[MCP Tools Reference](doc/MCP-TOOLS.md)** | All 53 MCP tools — parameters, return types, examples |
 | **[Architecture](doc/ARCHITECTURE.md)** | How base64-embedded thumbnails solve the Cowork sandbox restriction |
 | **[CORS Setup Guide](doc/CORS-SETUP.md)** | Optional — enable direct URL thumbnail loading for browser-viewed galleries |
 

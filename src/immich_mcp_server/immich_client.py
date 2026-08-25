@@ -17,13 +17,19 @@ class ImmichClient:
     # Class-level cache dir, resolved once
     _cache_dir: str | None = None
 
-    def __init__(self):
-        config = self._load_config_override()
+    def __init__(self, base_url: str | None = None, api_key: str | None = None):
+        # Explicit credentials always win — the config.json override only
+        # applies to default construction (otherwise rotating credentials
+        # would silently resurrect the old ones from disk).
+        if base_url is not None or api_key is not None:
+            config: dict = {}
+        else:
+            config = self._load_config_override()
         self.base_url = (
-            config.get("base_url") or os.environ.get("IMMICH_BASE_URL", "")
+            base_url or config.get("base_url") or os.environ.get("IMMICH_BASE_URL", "")
         ).rstrip("/")
         self.api_key = (
-            config.get("api_key") or os.environ.get("IMMICH_API_KEY", "")
+            api_key or config.get("api_key") or os.environ.get("IMMICH_API_KEY", "")
         )
         if not self.base_url or not self.api_key:
             raise ValueError(
@@ -323,8 +329,16 @@ class ImmichClient:
         Returns:
             dict with 'data' (base64 string) and 'type' (mime type).
         """
-        url = f"{self.base_url}/api/assets/{asset_id}/{size}"
-        params = {"edited": "true"} if edited else {}
+        # Immich 3.0+ exposes previews through the thumbnail endpoint with
+        # `size=preview` (the dedicated `/preview` route no longer exists).
+        if size == "preview":
+            url = f"{self.base_url}/api/assets/{asset_id}/thumbnail"
+            params: dict[str, str] = {"size": "preview"}
+        else:
+            url = f"{self.base_url}/api/assets/{asset_id}/thumbnail"
+            params = {}
+        if edited:
+            params["edited"] = "true"
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=self._headers, params=params)
             response.raise_for_status()

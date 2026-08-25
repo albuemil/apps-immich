@@ -5,32 +5,80 @@ Part of the immich-photo-manager plugin.
 License: MIT
 """
 
+import base64
 import json
+import os
+import sys
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .immich_client import ImmichClient
+
+# FastMCP's Settings model declares `lifespan` using a forward reference to the
+# FastMCP class (defined later in the SDK), which pydantic-settings reports as an
+# incomplete definition at startup. The field is never populated from environment
+# variables, so this is harmless — silence it to keep startup logs clean.
+try:
+    from pydantic_settings.sources.utils import IncompleteFieldDefinitionWarning
+except ImportError:  # pragma: no cover
+    IncompleteFieldDefinitionWarning = None
+
+if IncompleteFieldDefinitionWarning is not None:
+    warnings.filterwarnings("ignore", category=IncompleteFieldDefinitionWarning)
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """Initialize the Immich client on server startup."""
     client = ImmichClient()
-    # Verify connection at startup
+    # Verify connection at startup. Diagnostics go to stderr — under the
+    # stdio transport stdout carries JSON-RPC and must stay pristine.
     try:
         await client.ping()
     except Exception as e:
-        print(f"Warning: Could not connect to Immich at {client.base_url}: {e}")
+        print(
+            f"Warning: Could not connect to Immich at {client.base_url}: {e}",
+            file=sys.stderr,
+        )
     yield {"immich": client}
 
+
+# When served over HTTP behind a reverse proxy, the proxied Host header (e.g.
+# photos-mcp.example.com) must be allowed explicitly: FastMCP auto-enables DNS
+# rebinding protection that accepts only 127.0.0.1/localhost Hosts, answering
+# 421 Misdirected Request otherwise. MCP_ALLOWED_HOSTS is a comma-separated
+# list of additional allowed Host values; localhost stays allowed and
+# protection stays ON. Unset = SDK default behavior, unchanged.
+_extra_hosts = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+_transport_security = None
+if _extra_hosts:
+    # A configured host may be a bare host/IP (allow any port via the SDK's
+    # ":*" wildcard) or already include a port. The Host header always carries
+    # the port, so a bare value like "192.168.1.10" would never match
+    # "192.168.1.10:8626" — append a ":*" variant for portless entries.
+    _allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    _allowed_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    for h in _extra_hosts:
+        _allowed_hosts.append(h)
+        if ":" not in h:
+            _allowed_hosts.append(f"{h}:*")
+        _allowed_origins.extend((f"http://{h}", f"https://{h}"))
+    _transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=_allowed_origins,
+    )
 
 mcp = FastMCP(
     "immich-photo-manager",
     instructions="Intelligent photo management for Immich. Search, curate albums, and publish galleries.",
     lifespan=app_lifespan,
+    transport_security=_transport_security,
 )
 
 
@@ -90,21 +138,11 @@ async def update_credentials(ctx: Context, base_url: str, api_key: str) -> str:
 
     Returns: JSON with success status, photo/video counts confirming access, and persistence path.
     """
-    # 1. Create a new client with the provided credentials to validate them
-    import os
-    old_base = os.environ.get("IMMICH_BASE_URL", "")
-    old_key = os.environ.get("IMMICH_API_KEY", "")
-
+    # 1. Create a new client carrying exactly the provided credentials
+    # (explicit args bypass the config.json override and the environment)
     try:
-        # Temporarily set env vars so ImmichClient can init
-        # (the config.json override hasn't been written yet)
-        os.environ["IMMICH_BASE_URL"] = base_url
-        os.environ["IMMICH_API_KEY"] = api_key
-        new_client = ImmichClient()
+        new_client = ImmichClient(base_url=base_url, api_key=api_key)
     except Exception as e:
-        # Restore old env vars
-        os.environ["IMMICH_BASE_URL"] = old_base
-        os.environ["IMMICH_API_KEY"] = old_key
         return json.dumps({
             "success": False,
             "error": f"Invalid credentials: {e}",
@@ -114,8 +152,6 @@ async def update_credentials(ctx: Context, base_url: str, api_key: str) -> str:
     try:
         await new_client.ping()
     except Exception as e:
-        os.environ["IMMICH_BASE_URL"] = old_base
-        os.environ["IMMICH_API_KEY"] = old_key
         return json.dumps({
             "success": False,
             "error": (
@@ -127,7 +163,7 @@ async def update_credentials(ctx: Context, base_url: str, api_key: str) -> str:
     # 3. Persist to cache dir so they survive restarts
     try:
         config_path = ImmichClient.save_config(base_url, api_key)
-    except RuntimeError as e:
+    except RuntimeError:
         # Credentials work but can't persist — still swap the live client
         config_path = None
 
@@ -264,23 +300,30 @@ async def rotate_assets(
     results: dict = {"rotated": 0, "failed": 0, "errors": []}
     for aid in ids:
         try:
-            # Read current rotation and accumulate
-            current_angle = 0
+            # Read the full current edit list — apply replaces it wholesale,
+            # so anything not carried over (crop, mirror) would be lost.
             try:
-                edits = await client.get_asset_edits(aid)
-                for edit in edits.get("edits", []):
-                    if edit.get("action") == "rotate":
-                        current_angle = edit["parameters"].get("angle", 0)
-            except Exception:
-                pass
+                existing = (await client.get_asset_edits(aid)).get("edits", []) or []
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    existing = []  # asset simply has no edits yet
+                else:
+                    raise  # unreadable edits: fail the asset, never guess the angle
+            current_angle = 0
+            for edit in existing:
+                if edit.get("action") == "rotate":
+                    current_angle = edit.get("parameters", {}).get("angle", 0)
+            other_edits = [e for e in existing if e.get("action") != "rotate"]
             new_angle = (current_angle + angle) % 360
-            if new_angle == 0:
-                # Full circle — remove edits instead
-                await client.delete_asset_edits(aid)
+            new_edits = other_edits + (
+                [{"action": "rotate", "parameters": {"angle": new_angle}}]
+                if new_angle else []
+            )
+            if new_edits:
+                await client.apply_asset_edits(aid, new_edits)
             else:
-                await client.apply_asset_edits(aid, [
-                    {"action": "rotate", "parameters": {"angle": new_angle}},
-                ])
+                # Nothing left at all — remove the (rotation-only) edit record
+                await client.delete_asset_edits(aid)
             results["rotated"] += 1
         except Exception as e:
             results["failed"] += 1
@@ -698,6 +741,95 @@ async def get_thumbnails_batch(
         asset_ids, size, min(limit, 50)
     )
     return json.dumps(result, default=str)
+
+
+# ── Images (visual display) ─────────────────────────────────
+#
+# These tools return MCP image blocks (ImageContent) for clients that render
+# images inline — e.g. Open WebUI, Claude Desktop. They are an alternative view
+# of the same thumbnails; the get_*_thumbnail(s) tools above remain the default
+# and return base64 JSON, which the skills embed as data: URIs into HTML
+# galleries (the Cowork sandbox blocks external requests). Do not change those.
+
+
+def _image_format_from_mime(mime: str) -> str:
+    """Map an image MIME type to an Image format label."""
+    mapping = {
+        "image/jpeg": "jpeg",
+        "image/jpg": "jpeg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "image/heic": "heic",
+        "image/heif": "heic",
+        "image/avif": "avif",
+        "image/tiff": "tiff",
+    }
+    return mapping.get((mime or "image/jpeg").split(";")[0].strip().lower(), "jpeg")
+
+
+def _entry_to_image(entry: dict) -> Image:
+    """Convert a thumbnail entry dict (base64 data + MIME type) to an Image."""
+    data = entry.get("data", "")
+    raw = base64.b64decode(data) if data else b""
+    return Image(data=raw, format=_image_format_from_mime(entry.get("type", "image/jpeg")))
+
+
+@mcp.tool()
+async def get_asset_image(ctx: Context, asset_id: str, size: str = "thumbnail") -> Image:
+    """Get a single asset's thumbnail as an image block for inline visual display.
+    Use this in clients that render images (Open WebUI, Claude Desktop). For HTML
+    gallery generation with base64 data URIs (Cowork/skills), use get_asset_thumbnail
+    instead — it returns JSON. Read-only.
+
+    Args:
+        asset_id: The asset's UUID.
+        size: 'thumbnail' (250px, fast) or 'preview' (1440px, higher quality). Default: 'thumbnail'.
+
+    Returns: An image block (MCP ImageContent) for visual display.
+    """
+    result = await _client(ctx).get_asset_thumbnail(asset_id, size)
+    return _entry_to_image(result)
+
+
+@mcp.tool(structured_output=False)
+async def get_album_images(
+    ctx: Context, album_id: str, size: str = "thumbnail", limit: int = 20
+) -> list[Image]:
+    """Get an album's thumbnails as image blocks for inline visual display. Use this
+    to visually browse an album in clients that render images. For HTML gallery
+    generation with base64 data URIs (Cowork/skills), use get_album_thumbnails
+    instead — it returns JSON with filenames and dates. Read-only.
+
+    Args:
+        album_id: The album's UUID.
+        size: 'thumbnail' (250px) or 'preview' (1440px). Default: 'thumbnail'.
+        limit: Max thumbnails to return (1-50, default 20).
+
+    Returns: A list of image blocks suitable for visual display.
+    """
+    result = await _client(ctx).get_album_thumbnails(album_id, size, min(limit, 50))
+    return [_entry_to_image(t) for t in result.get("thumbnails", [])]
+
+
+@mcp.tool(structured_output=False)
+async def get_images_batch(
+    ctx: Context, asset_ids: list[str], size: str = "thumbnail", limit: int = 20
+) -> list[Image]:
+    """Get thumbnails for arbitrary asset IDs as image blocks for inline visual
+    display. Use this to visually show search results in clients that render images.
+    For HTML gallery generation with base64 data URIs (Cowork/skills), use
+    get_thumbnails_batch instead — it returns JSON with filenames and dates. Read-only.
+
+    Args:
+        asset_ids: List of asset UUIDs to fetch thumbnails for.
+        size: 'thumbnail' (250px) or 'preview' (1440px). Default: 'thumbnail'.
+        limit: Max thumbnails to return (1-50, default 20). Only the first N IDs are fetched.
+
+    Returns: A list of image blocks suitable for visual display.
+    """
+    result = await _client(ctx).get_thumbnails_batch(asset_ids, size, min(limit, 50))
+    return [_entry_to_image(t) for t in result.get("thumbnails", [])]
 
 
 # ── Shared Links ────────────────────────────────────────────

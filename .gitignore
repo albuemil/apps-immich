@@ -13,3 +13,10 @@ docs/superpowers/
 outputs/
 dist/
 *.egg-info/
+.venv/
+ipm/
+
+# Local launch script — contains real credentials (API key, host, IP).
+# Use start-mcp.sh.example as the committed template.
+start-mcp.sh
+mcp-server.log
