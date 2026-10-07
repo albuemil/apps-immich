@@ -54,6 +54,14 @@ Syncs 🏛️ landmark albums from GPS city/country metadata.
 - Paginates metadata search results
 - **Skill:** `/photos-update-locations`
 
+### `update_device_albums.py`
+Syncs 🎥 device albums ("everything shot with this device").
+- Rules live in `DEVICES` at the top of the script, keyed by album name without the prefix: exact EXIF camera `models` and/or `filename_prefixes`
+- Filename rules exist because some devices' videos carry no make/model in Immich (DJI Neo 2: only the photos have model `FC9470`; everything from the DJI Fly app is named `dji_fly_*`). The Osmo Mobile/Mimo files are `DJI_<date>_...` and are deliberately not matched
+- Adds missing assets only (never removes); sets description if empty; albums with the prefix but no rule are skipped
+- To add a device: create the `🎥 Name` album in Immich, add a `"Name": {...}` entry to `DEVICES`
+- **Skill:** `/photos-update-devices`
+
 > **Romanian diacritics quirk:** Immich's geocoder (GeoNames) stores city names with legacy
 > cedilla characters (`ş` U+015F, `ţ` U+0163) instead of the correct comma-below variants
 > (`ș` U+0219, `ț` U+021B). The script normalizes before searching so album names can use
@@ -68,6 +76,7 @@ Syncs 🏛️ landmark albums from GPS city/country metadata.
 | Travel | `✈️ YYYY/MM 🏳️ ISO/Location` | `✈️ 2023/04 🇪🇸 ES/Tenerife` |
 | Landmark | `🏛️ ISO/Location` | `🏛️ RO/Timișoara` |
 | People | `👤 Name` or `👥 Name1 & Name2` | `👤 Ina` |
+| Device | `🎥 Device` | `🎥 DJI Neo 2` |
 | Events | `🎉 YYYY/MM Title` | `🎉 2025/10 Nuntă Simo` |
 | dōTERRA | `ō YYYY/MM ISO/City Title` | `ō 2026/05 PL/Katowice Me` |
 | Pets | `🐾 Name` | `🐾 Palika` |
@@ -81,12 +90,18 @@ Syncs 🏛️ landmark albums from GPS city/country metadata.
 |-------|-------------|--------------|
 | `/photos-update-people` | `photos-update-people.md` | Runs `update_people_albums.py` |
 | `/photos-update-locations` | `photos-update-locations.md` | Runs `update_location_albums.py` |
+| `/photos-update-devices` | `photos-update-devices.md` | Runs `update_device_albums.py` |
 | `/photos-update-gps-radius` | `photos-update-gps-radius.md` | Runs `update_gps_radius_albums.py` |
 | `/photos-rotate` | `photos-rotate.md` | Processes rotate LEFT / rotate RIGHT albums via MCP |
 
 ---
 
 ## Session Log
+
+### 2026-10-07
+- Added `update_device_albums.py` + `/photos-update-devices` skill; created `🎥 DJI Neo 2` (26 assets: 25 videos + 1 photo, 2026-10-02/04)
+- Prefix is 🎥, not 📷 — `📷 Best of Emil` already uses 📷 for something else
+- Run on the unRAID box (no `httpx` in system Python there): use a venv, or run from WSL as usual
 
 ### 2026-07-14
 - Fixed Immich v3 breaking change: `GET /api/albums/{id}` no longer returns assets; all scripts updated to use timeline API
