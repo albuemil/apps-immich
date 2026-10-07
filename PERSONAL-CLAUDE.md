@@ -80,6 +80,7 @@ Syncs 🎥 device albums ("everything shot with this device").
 | Events | `🎉 YYYY/MM Title` | `🎉 2025/10 Nuntă Simo` |
 | dōTERRA | `ō YYYY/MM ISO/City Title` | `ō 2026/05 PL/Katowice Me` |
 | Pets | `🐾 Name` | `🐾 Palika` |
+| Cars | `🚗 Name` | `🚗 Tavia` |
 | Home/project | `🏗️ Location/Project` | `🏗️ Amzei/Gradina` |
 
 ---
@@ -99,6 +100,7 @@ Syncs 🎥 device albums ("everything shot with this device").
 ## Session Log
 
 ### 2026-10-07
+- Car albums get a 🚗 prefix: renamed `Tavia` → `🚗 Tavia`, created empty `🚗 Bubu`
 - Added `update_device_albums.py` + `/photos-update-devices` skill; created `🎥 DJI Neo 2` (26 assets: 25 videos + 1 photo, 2026-10-02/04); added the `compose_video_*` rule the same day (+12 videos, 38 total)
 - Prefix is 🎥, not 📷 — `📷 Best of Emil` already uses 📷 for something else
 - Run on the unRAID box (no `httpx` in system Python there): use a venv, or run from WSL as usual
