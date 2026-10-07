@@ -57,7 +57,7 @@ Syncs 🏛️ landmark albums from GPS city/country metadata.
 ### `update_device_albums.py`
 Syncs 🎥 device albums ("everything shot with this device").
 - Rules live in `DEVICES` at the top of the script, keyed by album name without the prefix: exact EXIF camera `models` and/or `filename_prefixes`
-- Filename rules exist because some devices' videos carry no make/model in Immich (DJI Neo 2: only the photos have model `FC9470`; everything from the DJI Fly app is named `dji_fly_*`). The Osmo Mobile/Mimo files are `DJI_<date>_...` and are deliberately not matched
+- Filename rules exist because some devices' videos carry no make/model in Immich (DJI Neo 2: only the photos have model `FC9470`; everything from the DJI Fly app is named `dji_fly_*`, and the 4K clips it renders are `compose_video_*`). The Osmo Mobile/Mimo files are `DJI_<date>_...` and are deliberately not matched
 - Adds missing assets only (never removes); sets description if empty; albums with the prefix but no rule are skipped
 - To add a device: create the `🎥 Name` album in Immich, add a `"Name": {...}` entry to `DEVICES`
 - **Skill:** `/photos-update-devices`
@@ -99,7 +99,7 @@ Syncs 🎥 device albums ("everything shot with this device").
 ## Session Log
 
 ### 2026-10-07
-- Added `update_device_albums.py` + `/photos-update-devices` skill; created `🎥 DJI Neo 2` (26 assets: 25 videos + 1 photo, 2026-10-02/04)
+- Added `update_device_albums.py` + `/photos-update-devices` skill; created `🎥 DJI Neo 2` (26 assets: 25 videos + 1 photo, 2026-10-02/04); added the `compose_video_*` rule the same day (+12 videos, 38 total)
 - Prefix is 🎥, not 📷 — `📷 Best of Emil` already uses 📷 for something else
 - Run on the unRAID box (no `httpx` in system Python there): use a venv, or run from WSL as usual
 

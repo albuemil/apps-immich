@@ -9,7 +9,7 @@ Versioning: `personal-vMAJOR.MINOR.PATCH` (independent from upstream plugin vers
 ## personal-v1.4.0 — 2026-10-07
 
 ### Added
-- `user_scripts/update_device_albums.py` — syncs 🎥 device albums from per-device rules (EXIF camera model and/or original filename prefix); first device: DJI Neo 2 (`FC9470`, `dji_fly_*`)
+- `user_scripts/update_device_albums.py` — syncs 🎥 device albums from per-device rules (EXIF camera model and/or original filename prefix); first device: DJI Neo 2 (`FC9470`, `dji_fly_*`, `compose_video_*`)
 - `.claude/commands/photos-update-devices.md` — `/photos-update-devices` skill
 
 ---

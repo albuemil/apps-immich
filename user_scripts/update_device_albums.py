@@ -40,8 +40,9 @@ DEVICE_PREFIX = "🎥"
 DEVICES = {
     "DJI Neo 2": {
         "models": ["FC9470"],
-        # files saved by the DJI Fly app; the Osmo/Mimo ones are DJI_<date>_...
-        "filename_prefixes": ["dji_fly_"],
+        # dji_fly_*: files saved by the DJI Fly app (the Osmo/Mimo ones are
+        # DJI_<date>_...); compose_video_*: 4K clips the DJI Fly app renders
+        "filename_prefixes": ["dji_fly_", "compose_video_"],
     },
 }
 
