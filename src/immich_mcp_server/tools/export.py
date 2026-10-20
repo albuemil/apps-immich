@@ -1,0 +1,537 @@
+"""PDF export: preview what would be exported, then build the PDF on this machine.
+
+Two tools live here. `get_export_preview` lists the assets an export would
+contain so the model knows what exists before it looks at images and writes
+captions. `export_pdf` fetches the images (and cuts video frames), hands
+everything to `pdf_export.build` and writes the file where the user asked.
+
+Every `@mcp.tool()` here registers on the shared FastMCP app from `..app` when this
+module is imported; `server.py` imports all tool modules and re-exports the functions.
+"""
+
+import asyncio
+import base64
+import datetime
+import io
+import json
+import os
+
+from mcp.server.mcpserver import Context
+
+from .. import __version__, pdf_export, video_frames
+from ..app import mcp, _client
+from ._common import ADDS_ONLY, READ_ONLY
+from ..pdf_export import AssetEntry, Document
+
+# Hard ceiling on assets per export. Above this a PDF stops being a document
+# and the fetch time (one preview per asset, in series) stops being reasonable.
+EXPORT_MAX = 500
+
+# `return_base64` above this size is refused: every megabyte of PDF is roughly
+# 350k tokens once base64-encoded into the conversation.
+BASE64_MAX_BYTES = 2 * 1024 * 1024
+
+# Seconds to wait for one map tile from the event loop while `render_map` runs
+# in a worker thread. Above the client's own 10 s HTTP timeout on purpose.
+TILE_WAIT_SECONDS = 15
+
+# Originals go into the PDF capped at this long side: A4 at 300 dpi is about
+# 2480 px, so 3000 keeps print quality without embedding 40 MB camera files.
+ORIGINAL_MAX_SIDE = 3000
+
+
+def _duration_seconds(raw: dict) -> float:
+    """Video duration in seconds from an Immich asset.
+
+    Immich returns the duration either as a number of milliseconds or as an
+    "H:MM:SS.mmm" string depending on the endpoint and version; both were seen
+    on 2.7.5 and 3.1.0. Anything else counts as unknown (0.0).
+    """
+    raw_duration = raw.get("duration")
+    if isinstance(raw_duration, (int, float)):
+        return round(float(raw_duration) / 1000.0, 3)
+    if isinstance(raw_duration, str) and ":" in raw_duration:
+        hours, minutes, seconds = raw_duration.split(":")
+        return round(int(hours) * 3600 + int(minutes) * 60 + float(seconds), 3)
+    return 0.0
+
+
+def _place(raw: dict) -> str:
+    """'City, Country' from the asset's EXIF, or an empty string when there is none."""
+    exif = raw.get("exifInfo") or {}
+    return ", ".join(part for part in (exif.get("city"), exif.get("country")) if part)
+
+
+def _summary(raw: dict) -> dict:
+    """The few fields of an asset that the preview shows and the PDF prints."""
+    return {
+        "id": raw["id"],
+        "type": raw.get("type", ""),
+        "filename": raw.get("originalFileName", ""),
+        "taken_at": raw.get("fileCreatedAt", ""),
+        "place": _place(raw),
+        "people": [person.get("name", "") for person in (raw.get("people") or []) if person.get("name")],
+        "duration": _duration_seconds(raw) if raw.get("type") == "VIDEO" else None,
+    }
+
+
+async def _collect_assets(client, album_id: str, asset_ids: list[str], limit: int):
+    """Resolve the export source to (title, raw assets, notes).
+
+    Exactly one of `album_id` / `asset_ids` must be given. `limit` is clamped
+    to 1..EXPORT_MAX; one extra asset is requested so the cut can be reported
+    honestly instead of silently returning a shorter list.
+    """
+    if bool(album_id) == bool(asset_ids):
+        raise ValueError("Pass exactly one of album_id or asset_ids.")
+    limit = max(1, min(int(limit or 100), EXPORT_MAX))
+    notes: list[str] = []
+    if album_id:
+        album = await client.get_album(album_id)
+        title = album.get("albumName") or "Immich export"
+        raw = await client.get_album_assets(album_id, limit=limit + 1, with_exif=True)
+    else:
+        title = ""
+        raw = await client.get_assets_by_ids(asset_ids[: limit + 1], with_exif=True)
+    if len(raw) > limit:
+        raw = raw[:limit]
+        notes.append(f"limit {limit} reached: only the first {limit} assets are included")
+    # A Live Photo is one moment stored twice: the still points at its motion
+    # clip through livePhotoVideoId. Keep the still, fold the clip.
+    motion_ids = {asset.get("livePhotoVideoId") for asset in raw if asset.get("livePhotoVideoId")}
+    if motion_ids:
+        kept = [asset for asset in raw if asset["id"] not in motion_ids]
+        folded = len(raw) - len(kept)
+        if folded:
+            raw = kept
+            notes.append(f"{folded} live photo motion clip(s) folded into their photos")
+    if not raw:
+        raise ValueError("No assets found for that album/ids.")
+    return title, raw, notes
+
+
+def _entry_from_asset(raw: dict, captions: dict) -> AssetEntry:
+    """An `AssetEntry` with the metadata filled in and no images yet."""
+    exif = raw.get("exifInfo") or {}
+    summary = _summary(raw)
+    return AssetEntry(
+        id=summary["id"],
+        kind=summary["type"],
+        filename=summary["filename"],
+        taken_at=summary["taken_at"][:19].replace("T", " "),
+        place=summary["place"],
+        camera=" ".join(part for part in (exif.get("make"), exif.get("model")) if part),
+        people=summary["people"],
+        tags=[tag.get("name", "") for tag in (raw.get("tags") or []) if tag.get("name")],
+        caption=str(captions.get(summary["id"], "")),
+        lat=exif.get("latitude"),
+        lon=exif.get("longitude"),
+    )
+
+
+async def _attach_video_frames(client, entry: AssetEntry, frames: int, interval: float,
+                               frame_size: str, times: list[float], notes: list[str]) -> bool:
+    """Cut frames for a video entry into `entry.images`; True when at least one frame landed.
+
+    Any failure degrades to the poster (the caller fetches it) and leaves a
+    note for the response: a bad video must never take the whole export down.
+    """
+    try:
+        data = await client.get_video_playback(entry.id)
+        if times:
+            # The caller looked at the video and chose these exact moments.
+            result = await asyncio.to_thread(video_frames.extract_frames_at, data, times, frame_size)
+        else:
+            result = await asyncio.to_thread(
+                video_frames.extract_frames, data, frames, frame_size, None, 0.0, 0.0, interval
+            )
+    except video_frames.TooManyFrames as exc:
+        notes.append(f"{entry.filename}: {exc}; poster used")
+        return False
+    except video_frames.NoVideoBackend as exc:
+        # One note for the whole export is enough; every video would repeat it.
+        if not any("poster" in note for note in notes):
+            notes.append(f"video frames unavailable ({exc}): posters used")
+        return False
+    except Exception as exc:
+        notes.append(f"{entry.filename}: frames failed ({exc}); poster used")
+        return False
+    if not result["frames"]:
+        notes.append(f"{entry.filename}: no frames decoded; poster used")
+        return False
+    entry.images = [base64.b64decode(frame["data"]) for frame in result["frames"]]
+    entry.timestamps = [frame["timestamp"] for frame in result["frames"]]
+    return True
+
+
+def _downscaled_original(data: bytes) -> bytes:
+    """The original re-encoded as a JPEG no larger than ORIGINAL_MAX_SIDE.
+
+    Raises whatever Pillow raises when the format cannot be decoded (a HEIC
+    without a HEIF plugin, a RAW file); the caller falls back to the preview.
+    """
+    import io
+
+    from PIL import Image, ImageOps
+
+    with Image.open(io.BytesIO(data)) as image:
+        # Photos carry their rotation in EXIF; apply it or portrait shots lie down.
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((ORIGINAL_MAX_SIDE, ORIGINAL_MAX_SIDE))
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG", quality=90)
+        return buffer.getvalue()
+
+
+async def _photo_bytes(client, entry: AssetEntry, image_size: str, notes: list[str]) -> bytes:
+    """The image that represents a photo (or a video's poster) at the asked quality."""
+    if image_size == "original" and entry.kind == "IMAGE":
+        original = await client.get_asset_original(entry.id)
+        try:
+            return await asyncio.to_thread(_downscaled_original, original["data"])
+        except Exception:
+            notes.append(f"{entry.id}: original could not be decoded ({original.get('type')}); preview used")
+    size = image_size if image_size in ("thumbnail", "preview") else "preview"
+    thumb = await client.get_asset_thumbnail(entry.id, size)
+    return base64.b64decode(thumb["data"])
+
+
+async def _asset_entry(client, raw: dict, image_size: str, frames: int, interval: float,
+                       frame_size: str, times: list[float], notes: list[str], captions: dict,
+                       per_frame: list[str]) -> AssetEntry:
+    """Build the entry for one asset: metadata, then frames for a video or the poster/preview."""
+    entry = _entry_from_asset(raw, captions)
+    entry.frame_captions = per_frame
+    wants_frames = entry.kind == "VIDEO" and (frames > 0 or interval > 0 or bool(times))
+    if wants_frames and await _attach_video_frames(client, entry, frames, interval, frame_size, times, notes):
+        return entry
+    entry.images = [await _photo_bytes(client, entry, image_size, notes)]
+    return entry
+
+
+async def _render_places_map(client, entries: list[AssetEntry], notes: list[str]) -> bytes | None:
+    """The OpenStreetMap image for the Places page, or None with a note explaining why."""
+    points = [(entry.lat, entry.lon) for entry in entries if entry.lat is not None and entry.lon is not None]
+    if not points:
+        # The map is on by default now, so assets without GPS are the normal
+        # case, not a problem worth a warning: the page just keeps the table.
+        return None
+
+    # `render_map` is synchronous and runs in a worker thread, while the tile
+    # download is a coroutine on the event loop. The callback bridges the two
+    # and memoizes so a tile shared by several points is fetched once.
+    tiles: dict = {}
+    loop = asyncio.get_running_loop()
+
+    def fetch(zoom, tile_x, tile_y):
+        """One tile's PNG bytes, fetched on the event loop from the worker thread."""
+        key = (zoom, tile_x, tile_y)
+        if key not in tiles:
+            future = asyncio.run_coroutine_threadsafe(client.fetch_tile(zoom, tile_x, tile_y), loop)
+            tiles[key] = future.result(TILE_WAIT_SECONDS)
+        return tiles[key]
+
+    map_png = await asyncio.to_thread(pdf_export.render_map, points, fetch)
+    if map_png is None:
+        notes.append("map could not be drawn (tiles unavailable); Places table only")
+    return map_png
+
+
+def _resolve_output_path(output_path: str, title: str) -> str:
+    """Where the PDF goes: the user's path, a directory, or the Desktop by default.
+
+    A directory gets a file named after the title inside it; a path without
+    the extension gets one. Existing files are never overwritten (`unique_path`).
+    """
+    if output_path:
+        path = os.path.expanduser(output_path)
+        if os.path.isdir(path):
+            path = os.path.join(path, f"{pdf_export.slugify(title)}.pdf")
+        elif not path.lower().endswith(".pdf"):
+            path = f"{path}.pdf"
+    else:
+        path = os.path.expanduser(f"~/Desktop/{pdf_export.slugify(title)}.pdf")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    return pdf_export.unique_path(path)
+
+
+def _count_pages(pdf: bytes) -> int:
+    """Page count through pypdf when it is installed, else by scanning the objects."""
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(io.BytesIO(pdf)).pages)
+    except Exception:
+        # pypdf missing or unable to parse: the file is already written, so a
+        # rough count is better than breaking the JSON contract.
+        return pdf.count(b"/Type /Page") - pdf.count(b"/Type /Pages")
+
+
+# Every export_pdf choice, phrased so the model can relay them as questions when
+# the user asked for "a PDF" without saying how they want it.
+EXPORT_OPTIONS = {
+    "layout": "detail (one asset per page with metadata; videos show a frame strip), "
+              "grid (six per page), photobook (full-page image; a video with several "
+              "chosen frames gets one full page per frame). Default: detail.",
+    "cover": "Cover page with title and first image. Default: on.",
+    "index": "Clickable index page, one line per asset. Default: on.",
+    "places": "Places page (countries/cities table, optional map). Default: on.",
+    "footer": "full (plugin name, server and page number), pages (just the page number), or none. Default: full.",
+    "header": "Repeat the title at the top of every page except the cover. Default: off.",
+    "videos_position": "Where the video pages go: mixed with the photos (default), first, or last.",
+    "order": "auto (albums read oldest to newest; asset_ids keep your order), oldest, newest, or given.",
+    "title": "Cover title. Default: album name or 'Immich export <date>'.",
+    "captions": "One text per asset, written after looking at the images. Default: none.",
+    "frames_per_video": "Evenly spaced frames per video, 0-120. Default: 4.",
+    "frame_interval": "One frame every N seconds instead. Default: off.",
+    "frame_times": "Exact seconds per video, for hand-picked moments. Default: none.",
+    "frame_captions": "One caption per chosen frame (photobook prints each on its page). Default: none.",
+    "image_size": "original (stored quality, default), preview (1440px) or thumbnail for photos.",
+    "frame_size": "preview (default; quality is free inside the PDF) or thumbnail for video frames.",
+    "language": "en or es for the fixed page labels. Default: en.",
+    "map": "OpenStreetMap map on the Places page when assets carry GPS. Default: on; map=false keeps everything inside your network.",
+    "output_path": "Where to write the file. Default: ~/Desktop/<title>.pdf, never overwritten.",
+    "return_base64": "Also return the PDF bytes into the conversation. Default: off (expensive).",
+}
+
+
+@mcp.tool(title="Get export preview", annotations=READ_ONLY)
+async def get_export_preview(ctx: Context, album_id: str = "", asset_ids: list[str] = [], limit: int = 100) -> str:
+    """List what export_pdf would include (id, type, filename, date, place, people,
+    video duration) so you know which assets exist before looking at images and
+    writing captions. Pass exactly one of album_id / asset_ids. Read-only.
+
+    The result also carries `options`: every choice export_pdf accepts, with its
+    default. When the user asked for a PDF without saying how they want it, show
+    them these choices and ask (layout, cover pages, which video moments, captions)
+    before exporting; when they did give specs, or just want "a PDF, defaults are
+    fine", export directly.
+
+    Args:
+        album_id: Album UUID, or
+        asset_ids: Explicit asset UUIDs (search results, a selection).
+        limit: Max assets (1-500, default 100).
+
+    Returns: JSON {title, count, assets:[...], warnings:[...]} or {"error": ...}.
+    """
+    try:
+        title, raw, notes = await _collect_assets(_client(ctx), album_id, asset_ids, limit)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps({
+        "title": title,
+        "count": len(raw),
+        "assets": [_summary(asset) for asset in raw],
+        "options": EXPORT_OPTIONS,
+        "warnings": notes,
+    })
+
+
+# Two videos further apart than this stop looking like one story: a themed
+# album (a trip, a car-spotting season) stays within it, a beach time-lapse
+# plus an exhibition years later does not.
+STORY_SPAN_DAYS = 90
+
+
+def _mixed_stories(raw: list[dict]) -> dict | None:
+    """The confirm gate for unrelated videos in a hand-picked selection: a payload
+    when its videos span more than STORY_SPAN_DAYS, None when they read as one
+    story. Albums are exempt: exporting an album is the user's own request."""
+    videos = [asset for asset in raw if asset.get("type") == "VIDEO"]
+    if len(videos) < 2:
+        return None
+    try:
+        taken = sorted(datetime.datetime.fromisoformat((asset.get("fileCreatedAt") or "").replace("Z", "+00:00"))
+                       for asset in videos)
+    except ValueError:
+        return None
+    span = (taken[-1] - taken[0]).days
+    if span <= STORY_SPAN_DAYS:
+        return None
+    return {
+        "confirm_required": True,
+        "reason": f"The selection has {len(videos)} videos {span} days apart; they look like different stories, and one PDF tells one story.",
+        "videos": [{"id": asset.get("id"), "filename": asset.get("originalFileName"),
+                    "taken_at": asset.get("fileCreatedAt")} for asset in videos],
+        "hint": "Ask the user: split into one export per story (recommended), or call again with confirm=true to mix them anyway.",
+    }
+
+
+@mcp.tool(title="Export PDF", annotations=ADDS_ONLY)
+async def export_pdf(
+    ctx: Context, album_id: str = "", asset_ids: list[str] = [], output_path: str = "",
+    title: str = "", captions: dict = {}, layout: str = "detail", frames_per_video: int = 4,
+    frame_interval: float = 0.0, frame_times: dict = {}, frame_captions: dict = {},
+    image_size: str = "original",
+    frame_size: str = "auto", language: str = "en", map: bool = True,
+    cover: bool = True, index: bool = True, places: bool = True, footer: str = "full",
+    header: bool = False, videos_position: str = "mixed", order: str = "auto",
+    confirm: bool = False, limit: int = 100,
+    return_base64: bool = False,
+) -> str:
+    """Build a PDF (cover, index, places, one section per asset) from an album or a
+    list of assets, on the machine running this server. Immich metadata (date, place,
+    camera, people, tags) is always included; pass `captions` {asset_id: text} with
+    what you saw to add your analysis. Video frames go straight into the PDF and cost
+    no tokens (up to 120 per video). The PDF never enters the conversation unless
+    return_base64=True. If the user asked for a PDF without saying how they want
+    it, call get_export_preview first and ask them about the choices it lists.
+
+    Keep the selection coherent: one story per PDF. Never mix unrelated assets
+    (two videos about different things, photos from different events) just to
+    show more; if the user's material spans several stories, offer one PDF per
+    story instead.
+
+    Args:
+        album_id: Album UUID, or asset_ids: explicit asset UUIDs (exactly one of the two).
+        output_path: Where to write (default ~/Desktop/<title>.pdf). Existing files are never overwritten.
+        title: Cover title (default: album name or "Immich export <date>").
+        captions: {asset_id: text} written after looking at the images.
+        layout: 'detail' (one asset per page with its data, default), 'grid' (six per page)
+            or 'photobook' (one asset per page, image as large as it fits, caption under
+            it; a video with several chosen frames unfolds into one full page per frame).
+        frames_per_video: Frames per video, evenly spaced (0-120, default 4; 0 = poster only).
+        frame_interval: One frame every N seconds instead of frames_per_video (same 120 cap).
+        frame_times: {asset_id: [seconds, ...]} exact moments for specific videos, chosen
+            after looking at their frames ("the representative frame"). Wins over
+            frames_per_video/frame_interval for the listed videos; others keep the spread.
+        frame_captions: {asset_id: [text, ...]} one caption per extracted frame, in frame
+            order (photobook prints each on its frame's page; other layouts ignore them).
+        image_size: 'original' (default): photos go in at the stored file's quality,
+            re-encoded to at most 3000px (a format the server cannot decode, like
+            some HEIC, falls back to preview with a note); 'preview' (1440px) or
+            'thumbnail' for smaller files.
+        frame_size: video frame size in the PDF: 'auto' (default, same as 'preview':
+            quality is free inside the PDF) or 'thumbnail' for a smaller file.
+        language: 'en' (default) or 'es' for the fixed labels on the pages (Index,
+            Places, Camera, page numbers); captions stay in whatever language you wrote.
+        map: Draw an OpenStreetMap map on the Places page when assets carry GPS
+            (default True; tiles come from tile.openstreetmap.org, the only
+            third-party call this server makes — pass map=False to skip it).
+        cover, index, places: Include each front-matter page (all default True;
+            turn them off for a print-ready photobook of bare pages).
+        footer: 'full' (plugin name, server and page number, default), 'pages'
+            (just the page number) or 'none'.
+        header: Repeat the title at the top of every page except the cover
+            (default False).
+        videos_position: Where the video pages (frame strips or frame pages) go:
+            'mixed' with the photos in the general order (default), 'first' or 'last'.
+        order: 'auto' (albums read oldest to newest, like the frames inside a video;
+            asset_ids keep the order you passed), 'oldest', 'newest' or 'given'.
+        confirm: Only asked for when explicit asset_ids mix videos more than 90 days
+            apart (different stories). Pass True only when the user themselves asked
+            to mix them; exporting a whole album never needs it.
+        limit: Max assets (1-500, default 100).
+        return_base64: Also return the PDF bytes (skipped above 2 MB; every MB is
+            roughly 350k tokens in the conversation).
+
+    Returns: JSON {path, pages, bytes, assets_included, assets_skipped:[{id, reason}], warnings:[...]}.
+    """
+    client = _client(ctx)
+    try:
+        album_title, raw, notes = await _collect_assets(client, album_id, asset_ids, limit)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    if not pdf_export._fpdf_available():
+        return json.dumps({"error": "PDF export needs fpdf2: `pip install fpdf2` (it ships with immich-photo-manager since 1.7.1)."})
+
+    # Arguments come from the model: clamp and default them rather than fail.
+    frames = max(0, min(int(frames_per_video or 0), video_frames.MAX_FRAMES))
+    interval = float(frame_interval or 0)
+    if layout not in ("detail", "grid", "photobook"):
+        layout = "detail"
+    if image_size not in ("thumbnail", "preview", "original"):
+        image_size = "preview"
+    # Frames in the PDF cost no conversation tokens, so quality is free there:
+    # "auto" means preview (1440px) always. "thumbnail" stays as an explicit
+    # choice for whoever wants a smaller file.
+    if frame_size not in ("thumbnail", "preview"):
+        frame_size = "preview"
+    title = title or album_title or f"Immich export {datetime.date.today().isoformat()}"
+
+    # Unrelated videos never mix silently — but an album IS the user's own
+    # request, so only hand-picked asset_ids selections go through the gate.
+    if asset_ids and not confirm:
+        gate = _mixed_stories(raw)
+        if gate:
+            return json.dumps(gate)
+
+    # A book reads oldest to newest, matching the frame strips; Immich hands
+    # albums back newest first, so albums get re-sorted by default.
+    effective_order = ("oldest" if album_id else "given") if order == "auto" else order
+    if effective_order in ("oldest", "newest"):
+        raw.sort(key=lambda asset: asset.get("fileCreatedAt") or "", reverse=(effective_order == "newest"))
+
+    # One asset failing (a 404 preview, a broken file) is reported, not fatal.
+    entries: list[AssetEntry] = []
+    skipped: list[dict] = []
+    for asset in raw:
+        try:
+            times = [float(moment) for moment in (frame_times or {}).get(asset.get("id"), [])]
+            per_frame = [str(text) for text in (frame_captions or {}).get(asset.get("id"), [])]
+            entries.append(await _asset_entry(client, asset, image_size, frames, interval,
+                                              frame_size, times, notes, captions or {}, per_frame))
+        except Exception as exc:
+            skipped.append({"id": asset.get("id"), "reason": str(exc)[:200]})
+    if not entries:
+        return json.dumps({"error": "No asset could be fetched.", "assets_skipped": skipped})
+
+    # The video pages (frame strips, frame pages) can open or close the PDF
+    # instead of sitting wherever the general order drops them.
+    if videos_position in ("first", "last"):
+        videos = [entry for entry in entries if entry.kind == "VIDEO"]
+        photos_only = [entry for entry in entries if entry.kind != "VIDEO"]
+        entries = videos + photos_only if videos_position == "first" else photos_only + videos
+
+    # The map lives on the Places page, so without that page there is nothing
+    # to fetch; without GPS the render returns None silently.
+    map_png = await _render_places_map(client, entries, notes) if (map and places) else None
+
+    photos = sum(1 for entry in entries if entry.kind == "IMAGE")
+    exported_on = datetime.date.today().isoformat()
+    if language == "es":
+        subtitle = f"{len(entries)} elementos · {photos} fotos, {len(entries) - photos} vídeos · exportado {exported_on}"
+    else:
+        language = language if language == "en" else "en"
+        subtitle = f"{len(entries)} assets · {photos} photos, {len(entries) - photos} videos · exported {exported_on}"
+    doc = Document(
+        title=title,
+        subtitle=subtitle,
+        source_url=client.base_url,
+        version=__version__,
+        layout=layout,
+        language=language,
+        assets=entries,
+        places=pdf_export.places_table(entries),
+        map_png=map_png,
+        with_cover=cover,
+        with_index=index,
+        with_places=places,
+        footer=footer if footer in ("full", "pages", "none") else "full",
+        with_header=header,
+    )
+    try:
+        pdf = await asyncio.to_thread(pdf_export.build, doc)
+    except pdf_export.NoPdfBackend as exc:
+        return json.dumps({"error": str(exc)})
+
+    path = _resolve_output_path(output_path, title)
+    with open(path, "wb") as handle:
+        handle.write(pdf)
+
+    pdf_b64 = None
+    if return_base64:
+        if len(pdf) > BASE64_MAX_BYTES:
+            notes.append("PDF larger than 2 MB: base64 not returned (read it from `path`)")
+        else:
+            pdf_b64 = base64.b64encode(pdf).decode("ascii")
+    out = {
+        "path": path,
+        "pages": _count_pages(pdf),
+        "bytes": len(pdf),
+        "assets_included": len(entries),
+        "assets_skipped": skipped,
+        "warnings": notes,
+    }
+    if pdf_b64 is not None:
+        out["pdf_base64"] = pdf_b64
+    return json.dumps(out)

@@ -1,7 +1,8 @@
 {
   "name": "immich-photo-manager",
-  "version": "1.4.0",
-  "description": "MCP server for intelligent photo management with Immich — interactive HTML galleries with Cowork Actions Panel, geographic album curation, library cleanup, duplicate detection, people & face management, tags, uploads, shared links, trash management, metadata repair, and 53 MCP tools. The first MCP server for self-hosted photo management.",
+  "displayName": "Photo Manager for Immich",
+  "version": "2.0.13",
+  "description": "MCP server for intelligent photo management with Immich — interactive HTML galleries with Cowork Actions Panel, geographic album curation, library cleanup, duplicate detection, people & face management, tags, uploads, shared links, trash management, metadata repair, PDF reports, and 94 MCP tools. Unofficial community plugin by Drolosoft, not affiliated with or endorsed by Immich or FUTO.",
   "mcpServers": "./.claude-plugin/mcp.json",
   "author": {
     "name": "Drolosoft",
@@ -10,7 +11,11 @@
   },
   "repository": "https://github.com/drolosoft/immich-photo-manager",
   "homepage": "https://drolosoft.com",
+  "documentationUrl": "https://github.com/drolosoft/immich-photo-manager/blob/main/doc/GETTING-STARTED.md",
+  "supportUrl": "https://github.com/drolosoft/immich-photo-manager/issues",
+  "privacyPolicyUrl": "https://github.com/drolosoft/immich-photo-manager#what-leaves-your-network",
   "license": "MIT",
+  "icon": "./assets/icon.png",
   "keywords": [
     "immich",
     "photos",
@@ -24,5 +29,20 @@
     "metadata",
     "mcp",
     "claude"
-  ]
+  ],
+  "userConfig": {
+    "immich_base_url": {
+      "type": "string",
+      "title": "Immich server URL",
+      "description": "Where your Immich lives, for example https://photos.example.com. Leave it empty to set it later with /setup-immich-photo-manager.",
+      "default": ""
+    },
+    "immich_api_key": {
+      "type": "string",
+      "title": "Immich API key",
+      "description": "An API key from your Immich user settings. Stored in your system's secure storage, never in a file of the plugin. Leave it empty to set it later with /setup-immich-photo-manager.",
+      "sensitive": true,
+      "default": ""
+    }
+  }
 }

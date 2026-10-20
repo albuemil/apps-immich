@@ -1,0 +1,417 @@
+"""get_video_frames: playback download → evenly spaced frames → image blocks.
+
+Immich generates one poster thumbnail per video and no per-frame previews
+for any client. The plugin goes one step further: it downloads the original
+via GET /assets/{id}/video/playback and cuts `count` frames evenly spaced over
+the duration, with PyAV (optional extra `[video]`) or the `ffmpeg` binary.
+"""
+
+import base64
+import io
+import json
+import shutil
+import subprocess
+
+import httpx
+import pytest
+import respx
+from mcp.server.mcpserver import Image
+
+from immich_mcp_server import server, video_frames
+from immich_mcp_server.immich_client import ImmichClient
+
+
+# ── the client fetches the playback bytes ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_video_playback_streams_bytes(env_credentials, isolated_cache):
+    client = ImmichClient()
+    with respx.mock(base_url="https://env.example.com") as mock:
+        mock.get("/api/assets/vid1/video/playback").mock(
+            return_value=httpx.Response(200, content=b"MP4BYTES",
+                                        headers={"content-type": "video/mp4"})
+        )
+        data = await client.get_video_playback("vid1")
+    assert data == b"MP4BYTES"
+
+
+# ── timestamps are evenly spaced, never at the very edges ───
+
+
+def test_frame_timestamps_are_centered_bins():
+    assert video_frames.frame_timestamps(3.0, 3) == [0.5, 1.5, 2.5]
+    assert video_frames.frame_timestamps(10.0, 1) == [5.0]
+    assert video_frames.frame_timestamps(0.0, 4) == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_count_is_clamped_to_1_120():
+    assert video_frames.clamp_count(0) == 1
+    assert video_frames.clamp_count(6) == 6
+    assert video_frames.clamp_count(99) == 99
+    assert video_frames.clamp_count(999) == video_frames.MAX_FRAMES == 120
+
+
+def test_segment_timestamps_are_centered_inside_segment():
+    assert video_frames.frame_timestamps(24.0, 2, start=8.0, end=12.0) == [9.0, 11.0]
+    assert video_frames.frame_timestamps(24.0, 2, start=20.0) == [21.0, 23.0]  # end=0 → to the end
+
+
+def test_interval_timestamps_one_per_second():
+    assert video_frames.interval_timestamps(3.0, 1.0) == [0.5, 1.5, 2.5]
+    assert video_frames.interval_timestamps(24.0, 10.0, start=8.0, end=12.0) == [10.0]
+    # Segment-relative formula: n = max(1, span // interval), frames at centers of n equal bins
+    assert video_frames.interval_timestamps(100.0, 10.0, start=25.0, end=35.0) == [30.0]
+    assert video_frames.interval_timestamps(100.0, 10.0, start=8.0, end=9.0) == [8.5]
+
+
+def test_plan_timestamps_caps_at_120():
+    with pytest.raises(video_frames.TooManyFrames) as exc:
+        video_frames.plan_timestamps(300.0, count=0, interval=1.0, start=0.0, end=0.0)
+    assert "120" in str(exc.value) and "start" in str(exc.value)
+    assert len(video_frames.plan_timestamps(300.0, count=0, interval=5.0, start=0.0, end=0.0)) == 60
+    assert video_frames.plan_timestamps(3.0, count=2, interval=0.0, start=0.0, end=0.0) == [0.75, 2.25]
+    # Early bailout: interval_timestamps raises before building millions of floats
+    with pytest.raises(video_frames.TooManyFrames) as exc:
+        video_frames.plan_timestamps(3600.0, count=0, interval=0.001, start=0.0, end=0.0)
+    assert "frames requested" in str(exc.value) and int(str(exc.value).split()[0]) > 1000000
+
+
+def test_estimate_tokens():
+    assert video_frames.estimate_tokens(12, "thumbnail") == 19200
+    assert video_frames.estimate_tokens(2, "preview") == 12800
+
+
+def test_extract_frames_segment_and_interval(clip):
+    seg = video_frames.extract_frames(clip, count=2, size="thumbnail", start=1.0, end=2.0)
+    assert [frame["timestamp"] for frame in seg["frames"]] == [1.25, 1.75]
+    every = video_frames.extract_frames(clip, count=0, size="thumbnail", interval=1.0)
+    assert [frame["timestamp"] for frame in every["frames"]] == [0.5, 1.5]  # 2 s clip
+
+
+def test_probe_duration(clip):
+    assert 1.9 <= video_frames.probe_duration(clip) <= 2.1
+
+
+# ── backends: a real 2-second clip, decoded by whatever is installed ──
+
+
+@pytest.fixture(scope="module")
+def clip(tmp_path_factory):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH; cannot synthesize a clip")
+    path = tmp_path_factory.mktemp("clip") / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         "color=c=purple:s=320x240:d=2", "-pix_fmt", "yuv420p", str(path)],
+        check=True,
+    )
+    return path.read_bytes()
+
+
+def _assert_jpeg_frames(frames, count, duration):
+    assert len(frames) == count
+    for frame in frames:
+        assert frame["type"] == "image/jpeg"
+        assert base64.b64decode(frame["data"])[:2] == b"\xff\xd8"  # JPEG SOI
+        assert 0 <= frame["timestamp"] <= duration
+
+
+def test_ffmpeg_backend_extracts_frames(clip):
+    result = video_frames.extract_frames(clip, count=3, size="thumbnail", backend="ffmpeg")
+    assert 1.9 <= result["duration"] <= 2.1
+    _assert_jpeg_frames(result["frames"], 3, result["duration"])
+
+
+def test_pyav_backend_extracts_frames(clip):
+    pytest.importorskip("av")
+    result = video_frames.extract_frames(clip, count=3, size="thumbnail", backend="pyav")
+    assert 1.9 <= result["duration"] <= 2.1
+    _assert_jpeg_frames(result["frames"], 3, result["duration"])
+
+
+def test_no_backend_names_both_options(monkeypatch):
+    monkeypatch.setattr(video_frames, "_pyav_available", lambda: False)
+    monkeypatch.setattr(video_frames.shutil, "which", lambda name: None)
+    with pytest.raises(video_frames.NoVideoBackend) as exc:
+        video_frames.extract_frames(b"", count=2, size="thumbnail")
+    msg = str(exc.value)
+    assert "pip install av" in msg and "ffmpeg" in msg
+
+
+# ── the tools ───────────────────────────────────────────────
+
+def _real_jpeg():
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (250, 140), "navy").save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+JPEG_REAL = _real_jpeg()
+
+
+def _fake_extract_real_jpeg(data, count=6, size="thumbnail", backend=None, start=0.0, end=0.0, interval=0.0):
+    total = int(60 / interval) if interval else count
+    return {"duration": 60.0, "backend": "stub",
+            "frames": [video_frames._entry(float(position), JPEG_REAL) for position in range(total)]}
+
+
+JPEG = b"\xff\xd8\xff\xe0FAKE"
+JPEG_B64 = base64.b64encode(JPEG).decode("ascii")
+
+
+class StubClient:
+    async def get_video_playback(self, asset_id):
+        return b"MP4"
+
+
+def _fake_extract(data, count, size, backend=None, start=0.0, end=0.0, interval=0.0):
+    return {
+        "duration": 3.0,
+        "backend": "stub",
+        "frames": [{"timestamp": float(i), "data": JPEG_B64, "type": "image/jpeg"}
+                   for i in range(count)],
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_gate_above_12_returns_plan(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 24.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", count=0, interval=1.0)
+    data = json.loads(raw)
+    assert data["confirm_required"] is True and data["frames_planned"] == 24
+    assert data["estimated_tokens"] == 24 * 1600 and data["segment"] == [0.0, 24.0]
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_confirm_true_extracts(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 24.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    result = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", count=20, confirm=True)
+    assert len(result) == 20 and all(isinstance(item, Image) for item in result)
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_over_cap_is_error_json(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 300.0)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", interval=1.0, confirm=True)
+    assert "120" in json.loads(raw)["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_zero_duration_with_interval_is_error_json(fake_ctx, monkeypatch):
+    """A duration probe that returns 0 (unreadable container, etc.) combined with
+    `interval` must not silently plan zero frames; it must surface a clear error."""
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 0.0)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", interval=1.0)
+    data = json.loads(raw)
+    assert "error" in data and "duration" in data["error"]
+    assert data["duration"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_returns_image_blocks(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 10.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    result = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", count=4)
+    assert [type(item) for item in result] == [Image] * 4
+    assert result[0].data == JPEG
+    assert result[0].to_image_content().mime_type == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_caps_count(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 60.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", count=50)
+    data = json.loads(raw)
+    assert data["confirm_required"] is True and data["frames_planned"] == 50
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_json_has_timestamps_and_base64(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 10.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    raw = await server.get_video_frames_json(fake_ctx(StubClient()), asset_id="vid1", count=2)
+    assert isinstance(raw, str)
+    data = json.loads(raw)
+    assert data["asset_id"] == "vid1" and data["duration"] == 3.0 and data["count"] == 2
+    assert data["frames"][1]["timestamp"] == 1.0
+    assert data["frames"][1]["data"] == JPEG_B64 and data["frames"][1]["type"] == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_json_reports_missing_backend(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 10.0)
+    def boom(*args, **kwargs):
+        raise video_frames.NoVideoBackend("install av or ffmpeg")
+    monkeypatch.setattr(video_frames, "extract_frames", boom)
+    data = json.loads(await server.get_video_frames_json(fake_ctx(StubClient()), asset_id="vid1"))
+    assert "install av" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_gate_segment_clamps_end(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 24.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1", count=20, end=1000.0)
+    data = json.loads(raw)
+    assert data["segment"] == [0.0, 24.0]
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_reports_missing_backend(fake_ctx, monkeypatch):
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 10.0)
+    def boom(*args, **kwargs):
+        raise video_frames.NoVideoBackend("no decoder")
+    monkeypatch.setattr(video_frames, "extract_frames", boom)
+    raw = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1")
+    data = json.loads(raw)
+    assert "no decoder" in data["error"]
+
+
+# ── rotation flag (vertical phone videos) ───────────────────
+
+
+@pytest.fixture(scope="module")
+def flagged_portrait_clip(tmp_path_factory):
+    """A landscape-encoded clip carrying a 90-degree display-rotation flag, the way phones record vertical video."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH; cannot synthesize a clip")
+    folder = tmp_path_factory.mktemp("rotated")
+    flat = folder / "flat.mp4"
+    flagged = folder / "flagged.mp4"
+    # Left half white, right half black: after the 90-degree display rotation one
+    # vertical half must be bright, and both backends must agree on which one.
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=568x320:d=2",
+         "-vf", "drawbox=x=0:y=0:w=284:h=320:color=white:t=fill", "-pix_fmt", "yuv420p", str(flat)],
+        check=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-display_rotation", "90", "-i", str(flat),
+         "-c", "copy", str(flagged)],
+        check=True,
+    )
+    return flagged.read_bytes()
+
+
+def _first_frame_image(result):
+    from PIL import Image
+    return Image.open(io.BytesIO(base64.b64decode(result["frames"][0]["data"]))).convert("L")
+
+
+def test_pyav_honours_the_rotation_flag(flagged_portrait_clip):
+    pytest.importorskip("av")
+    result = video_frames.extract_frames(flagged_portrait_clip, count=1, backend="pyav")
+    frame = _first_frame_image(result)
+    assert frame.size[0] < frame.size[1]  # portrait out, not sideways
+
+
+def test_pyav_rotation_direction_matches_ffmpeg(flagged_portrait_clip):
+    """Same clip through both backends must come out the same way up (ffmpeg auto-rotates)."""
+    pytest.importorskip("av")
+    pyav_frame = _first_frame_image(video_frames.extract_frames(flagged_portrait_clip, count=1, backend="pyav"))
+    ffmpeg_frame = _first_frame_image(video_frames.extract_frames(flagged_portrait_clip, count=1, backend="ffmpeg"))
+    assert abs(pyav_frame.size[0] - ffmpeg_frame.size[0]) <= 2
+    assert abs(pyav_frame.size[1] - ffmpeg_frame.size[1]) <= 2
+    # The source is a horizontal gradient, so after rotation one vertical half is
+    # bright and the other dark; both backends must agree on which.
+    def top_is_bright(image):
+        from PIL import ImageStat
+        width, height = image.size
+        top_mean = ImageStat.Stat(image.crop((0, 0, width, height // 4))).mean[0]
+        bottom_mean = ImageStat.Stat(image.crop((0, height - height // 4, width, height))).mean[0]
+        assert abs(top_mean - bottom_mean) > 60, "halves look alike; the fixture is wrong"
+        return top_mean > bottom_mean
+
+    assert top_is_bright(pyav_frame) == top_is_bright(ffmpeg_frame)
+
+
+# ── v1.10.0: exact timestamps ───────────────────────────────
+
+
+def test_extract_frames_at_cuts_the_asked_moments(clip):
+    result = video_frames.extract_frames_at(clip, [1.5, 0.5], size="thumbnail")
+    assert [frame["timestamp"] for frame in result["frames"]] == [0.5, 1.5]  # sorted
+    assert all(base64.b64decode(frame["data"])[:2] == b"\xff\xd8" for frame in result["frames"])
+
+
+def test_extract_frames_at_clamps_to_the_video(clip):
+    result = video_frames.extract_frames_at(clip, [-3.0, 99.0], size="thumbnail")
+    timestamps = [frame["timestamp"] for frame in result["frames"]]
+    assert len(timestamps) == 2 and timestamps[0] >= 0.0 and timestamps[-1] <= result["duration"]
+
+
+def test_extract_frames_at_refuses_more_than_the_cap(clip):
+    with pytest.raises(video_frames.TooManyFrames):
+        video_frames.extract_frames_at(clip, [0.1] * 121, size="thumbnail")
+
+
+# ── v1.11.0: contact sheets ─────────────────────────────────
+
+
+def test_contact_sheet_packs_frames_into_grids():
+    frames = [video_frames._entry(float(position), JPEG_REAL) for position in range(35)]
+    sheets = video_frames.contact_sheets(frames, columns=6, per_sheet=30)
+    assert len(sheets) == 2  # 30 + 5
+    from PIL import Image
+    first = Image.open(io.BytesIO(base64.b64decode(sheets[0]["data"])))
+    assert first.size[0] > first.size[1]  # six columns of small frames: wider than tall
+    assert sheets[0]["type"] == "image/jpeg"
+    assert sheets[0]["timestamps"] == [float(position) for position in range(30)]
+
+
+@pytest.mark.asyncio
+async def test_get_video_frames_sheet_returns_one_image_and_skips_the_gate(fake_ctx, monkeypatch):
+    """sheet=true: many frames, one composed image, no confirmation below the cap."""
+    monkeypatch.setattr(video_frames, "probe_duration", lambda data: 60.0)
+    monkeypatch.setattr(video_frames, "extract_frames", _fake_extract_real_jpeg)
+    result = await server.get_video_frames(fake_ctx(StubClient()), asset_id="vid1",
+                                           interval=1.0, sheet=True)
+    assert isinstance(result, list) and len(result) == 2  # 60 frames → two sheets of 30
+    assert all(isinstance(item, Image) for item in result)
+
+
+# ── v1.12.8: dead frames are dodged inside their bin ────────
+
+
+@pytest.fixture(scope="module")
+def clip_with_black_stripe(tmp_path_factory):
+    """3 s of detailed test pattern, fully black from 1.35 s to 1.65 s: the middle
+    bin's centre (1.5 s) lands exactly on dead frames."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH; cannot synthesize a clip")
+    path = tmp_path_factory.mktemp("stripe") / "stripe.mp4"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         "testsrc=size=320x240:rate=10:duration=3",
+         "-vf", "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t,1.35,1.65)'",
+         "-pix_fmt", "yuv420p", str(path)],
+        check=True,
+    )
+    return path.read_bytes()
+
+
+def _brightness_spread(frame):
+    from PIL import Image, ImageStat
+    image = Image.open(io.BytesIO(base64.b64decode(frame["data"]))).convert("L")
+    return ImageStat.Stat(image).stddev[0]
+
+
+def test_even_spacing_dodges_dead_frames(clip_with_black_stripe):
+    result = video_frames.extract_frames(clip_with_black_stripe, count=3, size="thumbnail")
+    middle = result["frames"][1]
+    assert _brightness_spread(middle) > 10.0  # not the black stripe
+    assert middle["timestamp"] != 1.5  # it moved off the dead centre
+    assert 1.0 <= middle["timestamp"] <= 2.0  # but stayed inside its own bin
+
+
+def test_explicit_times_are_never_dodged(clip_with_black_stripe):
+    result = video_frames.extract_frames_at(clip_with_black_stripe, [1.5], size="thumbnail")
+    frame = result["frames"][0]
+    assert frame["timestamp"] == 1.5
+    assert _brightness_spread(frame) < 10.0  # the black frame, exactly as asked

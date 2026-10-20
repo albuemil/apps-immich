@@ -1,7 +1,7 @@
 ---
 name: metadata-fixer
 description: >
-  Scan for and fix broken or missing photo metadata — dates, GPS coordinates, timezone offsets,
+  Scan for and fix broken or missing photo metadata: dates, GPS coordinates, timezone offsets,
   and camera info. Detects suspicious patterns (midnight/noon timestamps, missing GPS on geotagged trips)
   and proposes corrections using folder structure, neighboring photos, and EXIF inference.
   Use when the user says "fix metadata", "fix dates", "wrong dates", "missing GPS",
@@ -12,7 +12,7 @@ version: 1.1.0
 
 # Metadata Fixer
 
-## ⚠️ Connection Required — ALWAYS CHECK FIRST
+## ⚠️ Connection Required: ALWAYS CHECK FIRST
 
 **Before doing ANYTHING else in this skill, call `ping` on the Immich MCP server.**
 
@@ -36,16 +36,18 @@ Scan an Immich library for broken, missing, or suspicious metadata and propose c
 
 Common metadata problems in imported photo libraries:
 
-- **Noon/midnight timestamps** — dates recovered from folder paths lose the time component, defaulting to 00:00 or 12:00
-- **Missing GPS** — some export tools strip GPS data, or photos taken in airplane mode have none
-- **Wrong timezones** — photos taken abroad may have the wrong timezone offset, putting them hours off
-- **No EXIF dates** — screenshots, downloaded images, and some messaging apps strip date metadata entirely
+- **Noon/midnight timestamps**: dates recovered from folder paths lose the time component, defaulting to 00:00 or 12:00
+- **Missing GPS**: some export tools strip GPS data, or photos taken in airplane mode have none
+- **Wrong timezones**: photos taken abroad may have the wrong timezone offset, putting them hours off
+- **No EXIF dates**: screenshots, downloaded images, and some messaging apps strip date metadata entirely
 
 ## Analysis Workflow
 
 ### Step 1: Scan for Issues
 
-Run a comprehensive metadata quality scan:
+Over the API: walk the library with `get_timeline_buckets()`, then `get_timeline_bucket(time_bucket)` for the months to check. Each row carries the asset date, city and country, which is enough to spot exact-noon and exact-midnight timestamps and the days where some photos have a place and others do not. `get_asset_info` fills in the rest for a candidate.
+
+The queries below are an optional fallback that runs the same scan in one pass. The plugin never provides database access, so they only apply to a user who already has `psql` on their own Immich:
 
 ```sql
 -- Suspicious timestamps (exactly midnight or noon)
@@ -122,7 +124,7 @@ SUSPICIOUS TIMESTAMPS: 1,204 photos
   Example:
     IMG_2847.jpg  2019-07-14 12:00:00 → 2019-07-14 15:23:41 (interpolated)
     IMG_2848.jpg  2019-07-14 12:00:00 → 2019-07-14 15:25:12 (interpolated)
-    IMG_2849.jpg  2019-07-14 15:27:33 (has real EXIF — used as anchor)
+    IMG_2849.jpg  2019-07-14 15:27:33 (has real EXIF, used as anchor)
 
 MISSING GPS: 4,230 photos (on days where other photos have GPS)
   Fixable by neighbor inference: ~2,800 (66%)
@@ -152,9 +154,22 @@ update_asset_metadata(
 )
 ```
 
+When a fix applies the same value to many photos (one day's GPS, one roll's date), use `update_assets_metadata(asset_ids=[...], latitude=..., longitude=...)` instead of looping: same fields, one call, and only the fields you pass are touched.
+
+```python
+# One day's photos, all missing GPS, all from the same place
+update_assets_metadata(
+    asset_ids=["uuid-1", "uuid-2", "uuid-3"],
+    latitude=41.3874,
+    longitude=2.1686
+)
+```
+
+Keep `update_asset_metadata` (singular) for the fixes that differ per photo, such as an interpolated timestamp.
+
 > **Known limitation:** Immich writes a `.xmp` sidecar when updating EXIF. If photos are in an external library with special characters (emojis) in the path, exiftool may fail silently. Photos uploaded directly through Immich work correctly.
 
-Process in batches and log every change for audit:
+Log every change for audit:
 
 ```python
 fix_log = {
@@ -194,7 +209,7 @@ After applying fixes, re-run the scan to confirm issue counts dropped.
 
 ## Important Notes
 
-- **All fixes require explicit user approval** — never auto-modify metadata
+- **All fixes require explicit user approval**: never auto-modify metadata
 - Changes are applied via the Immich API, which updates both the database and EXIF sidecar
 - Always save a fix log (JSON) before applying any changes
 - Confidence scores help users decide which fixes to trust

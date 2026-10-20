@@ -1,7 +1,7 @@
 ---
 name: storage-optimizer
 description: >
-  Analyze disk usage in an Immich photo library and identify opportunities to reclaim storage —
+  Analyze disk usage in an Immich photo library and identify opportunities to reclaim storage:
   redundant RAW+JPEG pairs, oversized videos, bloated sidecar files, and format inefficiencies.
   Use when the user says "storage", "disk space", "what's eating my disk", "free up space",
   "storage report", "disk usage", "large files", "optimize storage", "space analysis",
@@ -11,7 +11,7 @@ version: 1.1.0
 
 # Storage Optimizer
 
-## ⚠️ Connection Required — ALWAYS CHECK FIRST
+## ⚠️ Connection Required: ALWAYS CHECK FIRST
 
 **Before doing ANYTHING else in this skill, call `ping` on the Immich MCP server.**
 
@@ -41,6 +41,8 @@ Analyze storage usage in an Immich photo library, identify the biggest consumers
 ## Analysis Workflow
 
 ### Step 1: Storage Overview
+
+`get_statistics` gives the totals (photos, videos, storage used) in one call, with no database access. The query below is the optional fallback for the per-type averages and maximums Immich's API does not report; the plugin never provides database access, so it only applies to a user who already has `psql` on their own Immich.
 
 ```sql
 -- Total storage by asset type
@@ -77,6 +79,9 @@ GROUP BY format ORDER BY sum(("exifInfo"->>'fileSizeInByte')::bigint) DESC;
 ### Step 3: Identify Top Storage Consumers
 
 **Large files (>50MB):**
+
+The MCP tool `search_large_assets(min_size_mb=50, size=50)` answers this without database access. It returns the biggest files largest-first with filename, size in MB and date. Use the SQL below only when you need columns it does not return, such as the camera make or the original path.
+
 ```sql
 SELECT "id", "originalPath", type,
   pg_size_pretty(("exifInfo"->>'fileSizeInByte')::bigint) as size,
@@ -144,6 +149,8 @@ GROUP BY 1 ORDER BY 1;
 
 Calculate: at current growth rate, how many months until disk is full?
 
+When only a count is needed (how many videos, how many photos from one camera, how many favorites), use `search_statistics` instead of a query or a search: it returns the number alone, so a whole breakdown costs a handful of integers rather than pages of assets. `get_timeline_buckets()` gives the month-by-month volume the growth projection needs, also in one call.
+
 ### Step 5: Generate Report
 
 ```
@@ -175,8 +182,8 @@ GROWTH RATE
 RECOMMENDATIONS
   1. Empty trash immediately → 12.3 GB freed
   2. Review RAW+JPEG pairs → keep JPEGs, remove RAWs for 15.8 GB
-  3. Review 43 videos >100MB — any worth compressing?
-  4. 234 large screenshots — worth keeping?
+  3. Review 43 videos >100MB, any worth compressing?
+  4. 234 large screenshots, worth keeping?
 ```
 
 ## Optimization Actions (User-Approved)
@@ -191,7 +198,7 @@ RECOMMENDATIONS
 ## Important Notes
 
 - Storage calculations use EXIF fileSizeInByte which reflects the original file, not Immich's generated thumbnails/previews
-- Immich also stores thumbnails, preview images, and ML embeddings — these are NOT included in the analysis but do consume disk space
+- Immich also stores thumbnails, preview images, and ML embeddings. They are NOT included in the analysis but do consume disk space
 - RAW+JPEG detection uses filename matching (base name without extension)
-- Video transcoding recommendations depend on the user's quality preferences — always ask
+- Video transcoding recommendations depend on the user's quality preferences, so always ask
 - Growth projection assumes linear growth, which may not hold for seasonal photographers

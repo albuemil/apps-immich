@@ -1,6 +1,7 @@
 #!/bin/bash
 # setup-mcp.sh - Interactive setup for the Immich MCP server
-# Configures: project .mcp.json, ~/.claude/mcp.json (Claude Code/Cowork), claude_desktop_config.json (Desktop app)
+# Configures: project .mcp.json, Claude Code user scope (claude mcp add-json), claude_desktop_config.json (Desktop app).
+# It never edits Claude's permission settings.
 set -e
 
 echo ""
@@ -27,13 +28,13 @@ echo "Python: $(python3 --version) ($PYTHON_PATH)"
 echo ""
 echo "Installing Python dependencies..."
 if [ -f "$SRC_DIR/requirements.txt" ]; then
-  pip3 install -r "$SRC_DIR/requirements.txt" --break-system-packages 2>/dev/null \
-    || pip3 install -r "$SRC_DIR/requirements.txt" 2>/dev/null \
-    || echo "WARNING: pip install failed. Please install dependencies manually: pip3 install mcp httpx"
+  pip3 install -r "$SRC_DIR/requirements.txt" --break-system-packages \
+    || pip3 install -r "$SRC_DIR/requirements.txt" \
+    || echo "WARNING: pip install failed. Please install dependencies manually: pip3 install -r $SRC_DIR/requirements.txt"
 else
-  pip3 install mcp httpx --break-system-packages 2>/dev/null \
-    || pip3 install mcp httpx 2>/dev/null \
-    || echo "WARNING: pip install failed. Please install manually: pip3 install mcp httpx"
+  pip3 install "mcp>=2.0.0,<3.0" "httpx>=0.24.0,<1.0" --break-system-packages \
+    || pip3 install "mcp>=2.0.0,<3.0" "httpx>=0.24.0,<1.0" \
+    || echo "WARNING: pip install failed. Please install manually: pip3 install 'mcp>=2.0.0,<3.0' 'httpx>=0.24.0,<1.0'"
 fi
 echo ""
 
@@ -93,9 +94,17 @@ echo ""
 read -p "Install globally for Claude Desktop + Cowork + Claude Code? (y/N): " GLOBAL
 if [ "$GLOBAL" = "y" ] || [ "$GLOBAL" = "Y" ]; then
 
-  # 2a. ~/.claude/mcp.json (Claude Code CLI + Cowork)
-  mkdir -p ~/.claude
-  write_immich_config ~/.claude/mcp.json merge
+  # 2a. Claude Code, user scope (every folder). Claude Code does not read
+  # ~/.claude/mcp.json; the supported way is `claude mcp add-json`.
+  if command -v claude &>/dev/null; then
+    ENTRY_JSON=$(PYTHON_PATH="$PYTHON_PATH" SRC_DIR="$SRC_DIR" IMMICH_URL="$IMMICH_URL" IMMICH_KEY="$IMMICH_KEY" python3 -c '
+import json, os
+print(json.dumps({"command": os.environ["PYTHON_PATH"], "args": ["-m", "immich_mcp_server"], "env": {"PYTHONPATH": os.environ["SRC_DIR"], "MCP_TRANSPORT": "stdio", "IMMICH_BASE_URL": os.environ["IMMICH_URL"], "IMMICH_API_KEY": os.environ["IMMICH_KEY"]}}))')
+    claude mcp remove immich -s user >/dev/null 2>&1 || true
+    claude mcp add-json immich "$ENTRY_JSON" -s user && echo "  Registered 'immich' in Claude Code (user scope)"
+  else
+    echo "  claude CLI not found (skipping Claude Code user-scope registration)"
+  fi
 
   # 2b. Claude Desktop config (macOS)
   DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
@@ -111,29 +120,10 @@ if [ "$GLOBAL" = "y" ] || [ "$GLOBAL" = "Y" ]; then
     write_immich_config "$LINUX_DESKTOP" merge
   fi
 
-  # 2d. Auto-allow immich MCP tools in ~/.claude/settings.json
-  SETTINGS_FILE=~/.claude/settings.json
-  if [ -f "$SETTINGS_FILE" ]; then
-    SETTINGS_FILE="$SETTINGS_FILE" python3 - <<'PYEOF'
-import json, os
-
-sf = os.environ["SETTINGS_FILE"]
-with open(sf) as f:
-    settings = json.load(f)
-
-allow = settings.setdefault("permissions", {}).setdefault("allow", [])
-if "mcp__immich__*" not in allow:
-    allow.append("mcp__immich__*")
-    with open(sf, "w") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
-    print("  Added mcp__immich__* to permissions.allow in " + sf)
-else:
-    print("  mcp__immich__* already in permissions.allow")
-PYEOF
-  else
-    echo "  ~/.claude/settings.json not found (skipping auto-allow)"
-  fi
+  # The script never touches ~/.claude/settings.json: whether the immich tools
+  # run without a prompt is the user's call, made inside Claude Code.
+  echo "  To let the immich tools run without a prompt, add mcp__immich__* under"
+  echo "  Allow in /permissions inside Claude Code."
 
   echo ""
   echo "Global installation complete."
@@ -149,13 +139,17 @@ import os
 try:
     import httpx
 
+    # /users/me needs a valid key; /server/ping would answer 200 to anything.
     r = httpx.get(
-        os.environ["IMMICH_URL"] + "/api/server/ping",
+        os.environ["IMMICH_URL"].rstrip("/") + "/api/users/me",
         headers={"x-api-key": os.environ["IMMICH_KEY"]},
         timeout=10,
     )
     if r.status_code == 200:
-        print("  Connection OK! Server responded.")
+        print(f"  Connection OK! Logged in as {r.json().get('email', '?')}.")
+    elif r.status_code in (401, 403):
+        print("  WARNING: the server answered but rejected the API key (HTTP "
+              f"{r.status_code}). Check the key.")
     else:
         print(f"  WARNING: Server returned HTTP {r.status_code}")
 except Exception as e:
@@ -166,7 +160,6 @@ echo ""
 echo "=== Setup complete! ==="
 echo ""
 echo "Next steps:"
-echo "  1. Restart Claude Desktop (Cmd+Q then reopen)"
-echo "  2. Start a new Cowork session"
-echo "  3. Ask Claude: 'use the immich ping tool'"
+echo "  1. Restart Claude Desktop (Cmd+Q then reopen) or start a new Claude Code session"
+echo "  2. Ask: 'What Immich version am I connected to?'"
 echo ""
