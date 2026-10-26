@@ -41,8 +41,9 @@ DEVICES = {
     "DJI Neo 2": {
         "models": ["FC9470"],
         # dji_fly_*: files saved by the DJI Fly app (the Osmo/Mimo ones are
-        # DJI_<date>_...); compose_video_*: 4K clips the DJI Fly app renders
-        "filename_prefixes": ["dji_fly_", "compose_video_"],
+        # DJI_<date>_...); compose_video_*: 4K clips the DJI Fly app renders;
+        # Screen_Recording_*: phone screen recordings of the live view while flying
+        "filename_prefixes": ["dji_fly_", "compose_video_", "screen_recording_"],
     },
 }
 
